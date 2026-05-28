@@ -859,79 +859,12 @@ impl LLMPreferences {
         self.custom_llms = build_custom_llm_infos(ApiKeyManager::as_ref(app).keys());
     }
 
-    fn sanitize_disabled_custom_model_preferences(&mut self, ctx: &mut ModelContext<Self>) {
-        if Self::custom_inference_enabled(ctx) || self.custom_llms.is_empty() {
-            return;
-        }
-
-        let custom_ids: HashSet<_> = self
-            .custom_llms
-            .iter()
-            .map(|info| info.id.clone())
-            .collect();
-        let mut updated_agent_mode = false;
-        let mut updated_coding = false;
-        let mut updated_other = false;
-
-        self.base_llm_for_terminal_view.retain(|_, id| {
-            let keep = !custom_ids.contains(id);
-            updated_agent_mode |= !keep;
-            keep
-        });
-
-        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
-            for profile_id in profiles.get_all_profile_ids() {
-                let Some(profile) = profiles.get_profile_by_id(profile_id, ctx) else {
-                    continue;
-                };
-                let profile_data = profile.data();
-
-                if profile_data
-                    .base_model
-                    .as_ref()
-                    .is_some_and(|id| custom_ids.contains(id))
-                {
-                    profiles.set_base_model(profile_id, None, ctx);
-                    profiles.set_context_window_limit(profile_id, None, ctx);
-                    updated_agent_mode = true;
-                }
-                if profile_data
-                    .coding_model
-                    .as_ref()
-                    .is_some_and(|id| custom_ids.contains(id))
-                {
-                    profiles.set_coding_model(profile_id, None, ctx);
-                    updated_coding = true;
-                }
-                if profile_data
-                    .cli_agent_model
-                    .as_ref()
-                    .is_some_and(|id| custom_ids.contains(id))
-                {
-                    profiles.set_cli_agent_model(profile_id, None, ctx);
-                    updated_other = true;
-                }
-                if profile_data
-                    .computer_use_model
-                    .as_ref()
-                    .is_some_and(|id| custom_ids.contains(id))
-                {
-                    profiles.set_computer_use_model(profile_id, None, ctx);
-                    updated_other = true;
-                }
-            }
-        });
-
-        if updated_agent_mode {
-            self.trigger_snapshot_save(ctx);
-            ctx.emit(LLMPreferencesEvent::UpdatedActiveAgentModeLLM);
-        }
-        if updated_coding {
-            ctx.emit(LLMPreferencesEvent::UpdatedActiveCodingLLM);
-        }
-        if updated_other {
-            ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
-        }
+    fn sanitize_disabled_custom_model_preferences(&mut self, _ctx: &mut ModelContext<Self>) {
+        // Custom-endpoint model selections are intentionally preserved regardless of whether
+        // the CustomInferenceEndpoints feature flag or workspace entitlement is currently
+        // active. Clearing them silently on a workspace/team change is confusing to users
+        // who explicitly configured a custom endpoint — their selection should persist until
+        // they change it manually.
     }
 
     /// Returns the default base model as a fallback.
@@ -1176,6 +1109,12 @@ impl LLMPreferences {
     /// or effectively disabled, and clear orphaned context window limits
     /// for non-configurable or unusable models.
     ///
+    /// Custom-endpoint model selections are intentionally preserved even when
+    /// the server model list changes or the feature flag/entitlement state
+    /// toggles — the user explicitly configured them and clearing them silently
+    /// is confusing. They will simply fail at request time if the endpoint is
+    /// unreachable, which is a better user experience than a silent reset.
+    ///
     /// Called both when the model list is refreshed from the server and when
     /// BYOK API keys change (since `RequiresUpgrade` usability is BYOK-aware).
     fn reconcile_disabled_model_preferences(&self, ctx: &mut ModelContext<Self>) {
@@ -1188,6 +1127,14 @@ impl LLMPreferences {
                     let effective_base_model_id = preferred_base_model
                         .as_ref()
                         .unwrap_or(&self.models_by_feature.agent_mode.default_id);
+
+                    // Never clear a user-configured custom-endpoint model: the user owns
+                    // that choice and it should survive server model-list refreshes and
+                    // feature-flag changes.
+                    let preferred_base_is_custom = preferred_base_model
+                        .as_ref()
+                        .is_some_and(|id| self.custom_llm_info_for_id(id).is_some());
+
                     let effective_base_model_usable = self
                         .models_by_feature
                         .agent_mode
@@ -1200,44 +1147,54 @@ impl LLMPreferences {
                         .is_some_and(|info| info.context_window.is_configurable);
                     let has_context_window_limit = profile_data.context_window_limit.is_some();
 
-                    if preferred_base_model.is_some() && effective_base_model_unusable {
+                    if preferred_base_model.is_some()
+                        && effective_base_model_unusable
+                        && !preferred_base_is_custom
+                    {
                         profiles.set_base_model(profile_id, None, ctx);
                     }
                     if has_context_window_limit
                         && (effective_base_model_unusable || !effective_base_model_is_configurable)
+                        && !preferred_base_is_custom
                     {
                         profiles.set_context_window_limit(profile_id, None, ctx);
                     }
                     if let Some(preferred_llm_id) = &profile.data().coding_model {
-                        if self
-                            .models_by_feature
-                            .coding
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .or_else(|| {
-                                self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                            })
-                            .is_none()
+                        let is_custom = self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        if !is_custom
+                            && self
+                                .models_by_feature
+                                .coding
+                                .usable_info_for_id(preferred_llm_id, ctx)
+                                .or_else(|| {
+                                    self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
+                                })
+                                .is_none()
                         {
                             profiles.set_coding_model(profile_id, None, ctx);
                         }
                     }
                     if let Some(preferred_llm_id) = &profile.data().cli_agent_model {
-                        if self
-                            .get_cli_agent_available()
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .or_else(|| {
-                                self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                            })
-                            .is_none()
+                        let is_custom = self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        if !is_custom
+                            && self
+                                .get_cli_agent_available()
+                                .usable_info_for_id(preferred_llm_id, ctx)
+                                .or_else(|| {
+                                    self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
+                                })
+                                .is_none()
                         {
                             profiles.set_cli_agent_model(profile_id, None, ctx);
                         }
                     }
                     if let Some(preferred_llm_id) = &profile.data().computer_use_model {
-                        if self
-                            .get_computer_use_available()
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .is_none()
+                        let is_custom = self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        if !is_custom
+                            && self
+                                .get_computer_use_available()
+                                .usable_info_for_id(preferred_llm_id, ctx)
+                                .is_none()
                         {
                             profiles.set_computer_use_model(profile_id, None, ctx);
                         }
