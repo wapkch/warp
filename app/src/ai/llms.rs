@@ -702,35 +702,55 @@ impl LLMPreferences {
     }
 
     /// Returns the set of LLMs available for Agent Mode use.
+    ///
+    /// When the user has at least one custom-endpoint model configured, built-in server models
+    /// are hidden so the picker is not cluttered with models that will never be used.
     pub fn get_base_llm_choices_for_agent_mode(
         &self,
         app: &AppContext,
     ) -> impl Iterator<Item = &LLMInfo> {
+        let custom_choices = self.custom_llm_choices(app);
+        let show_builtin = custom_choices.len() == 0;
         // Don't show admin-disabled models in the dropdown
         self.models_by_feature
             .agent_mode
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            .filter(move |llm| {
+                show_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices(app))
     }
 
     /// Returns the set of LLMs available for coding.
+    ///
+    /// When the user has at least one custom-endpoint model configured, built-in server models
+    /// are hidden so the picker is not cluttered with models that will never be used.
     pub fn get_coding_llm_choices(&self, app: &AppContext) -> impl Iterator<Item = &LLMInfo> {
+        let custom_choices = self.custom_llm_choices(app);
+        let show_builtin = custom_choices.len() == 0;
         // Don't show admin-disabled models in the dropdown
         self.models_by_feature
             .coding
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            .filter(move |llm| {
+                show_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices(app))
     }
 
     /// Returns the set of LLMs available for CLI agent.
+    ///
+    /// When the user has at least one custom-endpoint model configured, built-in server models
+    /// are hidden so the picker is not cluttered with models that will never be used.
     pub fn get_cli_agent_llm_choices(&self, app: &AppContext) -> impl Iterator<Item = &LLMInfo> {
+        let custom_choices = self.custom_llm_choices(app);
+        let show_builtin = custom_choices.len() == 0;
         self.get_cli_agent_available()
             .choices
             .iter()
+            .filter(move |_| show_builtin)
             .chain(self.custom_llm_choices(app))
     }
 
