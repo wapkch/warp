@@ -1,18 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, CustomEndpoint, CustomEndpointModel};
 pub use ai::LLMId;
+use ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, CustomEndpoint, CustomEndpointModel};
 use parking_lot::FairMutex;
-use serde::{de, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use warp_core::features::FeatureFlag;
 use warp_core::ui::icons::Icon;
 use warp_core::user_preferences::GetUserPreferences;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
 
 use super::execution_profiles::profiles::AIExecutionProfilesModel;
-use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::auth::AuthStateProvider;
+use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind};
 use crate::report_error;
 use crate::server::server_api::ServerApiProvider;
@@ -574,6 +574,10 @@ impl LLMPreferences {
                 new_status: NetworkStatusKind::Online,
             } = event
             {
+                log::info!(
+                    "[llms] NetworkStatusChanged(Online) -> refresh_authed_models (custom_llms_len={})",
+                    me.custom_llms.len(),
+                );
                 me.refresh_authed_models(ctx);
             }
         });
@@ -584,12 +588,21 @@ impl LLMPreferences {
         // have a personal workspace. This is a stop-gap.
         ctx.subscribe_to_model(&AuthManager::handle(ctx), |me, event, ctx| {
             if let AuthManagerEvent::AuthComplete = event {
+                log::info!(
+                    "[llms] AuthManagerEvent::AuthComplete -> refresh_authed_models (custom_llms_len={})",
+                    me.custom_llms.len(),
+                );
                 me.refresh_authed_models(ctx);
             }
         });
 
         ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, event, ctx| {
             if let UserWorkspacesEvent::TeamsChanged = event {
+                log::info!(
+                    "[llms] UserWorkspacesEvent::TeamsChanged -> sanitize+refresh (custom_llms_len={}, custom_inference_enabled={})",
+                    me.custom_llms.len(),
+                    Self::custom_inference_enabled(ctx),
+                );
                 me.sanitize_disabled_custom_model_preferences(ctx);
                 me.refresh_authed_models(ctx);
             }
@@ -602,6 +615,10 @@ impl LLMPreferences {
         ctx.subscribe_to_model(
             &ApiKeyManager::handle(ctx),
             |me, _event: &ApiKeyManagerEvent, ctx| {
+                log::info!(
+                    "[llms] ApiKeyManagerEvent::KeysUpdated -> rebuild+reconcile (custom_llms_len_before={})",
+                    me.custom_llms.len(),
+                );
                 me.rebuild_custom_llms(ctx);
                 me.reconcile_disabled_model_preferences(ctx);
                 ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
@@ -646,30 +663,42 @@ impl LLMPreferences {
         if let Some(terminal_view_id) = terminal_view_id {
             let raw_override = self.base_llm_for_terminal_view.get(&terminal_view_id);
             if let Some(llm_id) = raw_override {
+                // Always resolve custom-endpoint overrides regardless of feature-flag state:
+                // the user explicitly chose this model and it must survive flag toggles.
                 if let Some(llm_info) = self
                     .models_by_feature
                     .agent_mode
                     .info_for_id(llm_id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(llm_id, app))
+                    .or_else(|| self.custom_llm_info_for_id(llm_id))
                 {
                     return llm_info;
                 }
+                log::warn!(
+                    "[llms] base override id={llm_id:?} not found in builtin or custom; falling through to profile/default",
+                );
             }
         }
 
         let profile = AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
 
-        profile
-            .data()
-            .base_model
-            .clone()
-            .and_then(|id| {
-                self.models_by_feature
-                    .agent_mode
-                    .info_for_id(&id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
-            })
-            .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
+        let preferred = profile.data().base_model.clone();
+        let resolved = preferred.clone().and_then(|id| {
+            self.models_by_feature
+                .agent_mode
+                .info_for_id(&id)
+                // Always resolve custom-endpoint profile selections regardless of feature-flag
+                // state so the user's explicit choice is honoured at request time.
+                .or_else(|| self.custom_llm_info_for_id(&id))
+        });
+        if resolved.is_none() {
+            if let Some(id) = preferred.as_ref() {
+                log::warn!(
+                    "[llms] preferred base_model id={id:?} not resolvable (custom_llms_len={}); falling back to default",
+                    self.custom_llms.len(),
+                );
+            }
+        }
+        resolved.unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
     }
 
     pub fn get_active_coding_model<'a>(
@@ -696,7 +725,7 @@ impl LLMPreferences {
                 self.models_by_feature
                     .coding
                     .info_for_id(&id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
+                    .or_else(|| self.custom_llm_info_for_id(&id))
             })
             .unwrap_or_else(|| self.models_by_feature.coding.default_llm_info())
     }
@@ -770,7 +799,7 @@ impl LLMPreferences {
             .and_then(|id| {
                 available
                     .info_for_id(&id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
+                    .or_else(|| self.custom_llm_info_for_id(&id))
             })
             .unwrap_or_else(|| available.default_llm_info())
     }
@@ -850,12 +879,6 @@ impl LLMPreferences {
             .unwrap_or_else(|| CUSTOM_ENDPOINT_USAGE_FALLBACK_LABEL.to_string())
     }
 
-    fn custom_llm_info_for_id_if_enabled(&self, id: &LLMId, app: &AppContext) -> Option<&LLMInfo> {
-        Self::custom_inference_enabled(app)
-            .then(|| self.custom_llm_info_for_id(id))
-            .flatten()
-    }
-
     /// Iterator over the user's custom-endpoint LLMs, gated on the feature flag and entitlement.
     pub fn custom_llm_choices(&self, app: &AppContext) -> std::slice::Iter<'_, LLMInfo> {
         if Self::custom_inference_enabled(app) {
@@ -875,8 +898,30 @@ impl LLMPreferences {
     /// Reads the user's current `ApiKeyManager.custom_endpoints` and replaces `custom_llms`
     /// with synthetic `LLMInfo`s. Called on every `ApiKeyManagerEvent::KeysUpdated`, so adds,
     /// edits, and removals all propagate immediately.
+    ///
+    /// Defensive: if the rebuilt list is empty but the previous list was non-empty, this is
+    /// almost certainly a transient keychain read returning an empty `ApiKeys` payload (e.g.
+    /// secure-storage is locked, or the async secure-storage write hasn't settled yet). In
+    /// that case keep the previous `custom_llms` so downstream `reconcile_disabled_model_preferences`
+    /// doesn't observe a momentarily-empty list and decide to clear the user's profile selection.
+    /// The next non-empty `KeysUpdated` will overwrite normally.
     fn rebuild_custom_llms(&mut self, app: &AppContext) {
-        self.custom_llms = build_custom_llm_infos(ApiKeyManager::as_ref(app).keys());
+        let keys = ApiKeyManager::as_ref(app).keys();
+        let rebuilt = build_custom_llm_infos(keys);
+        let prev_len = self.custom_llms.len();
+        let raw_endpoints = keys.custom_endpoints.len();
+        if rebuilt.is_empty() && prev_len > 0 && raw_endpoints == 0 {
+            log::warn!(
+                "[llms] rebuild_custom_llms: rebuilt list is empty (raw_endpoints=0) while previous was {prev_len}; \
+                 suspecting transient keychain read — preserving previous custom_llms",
+            );
+            return;
+        }
+        log::info!(
+            "[llms] rebuild_custom_llms: prev_len={prev_len} -> new_len={} (raw_endpoints={raw_endpoints})",
+            rebuilt.len(),
+        );
+        self.custom_llms = rebuilt;
     }
 
     fn sanitize_disabled_custom_model_preferences(&mut self, _ctx: &mut ModelContext<Self>) {
@@ -1088,6 +1133,12 @@ impl LLMPreferences {
     fn on_server_update(&mut self, update: ModelsByFeature, ctx: &mut ModelContext<Self>) {
         let has_existing_persisted_config = get_cached_models(ctx).is_some();
 
+        log::info!(
+            "[llms] on_server_update: server agent_mode_choices={}, custom_llms_len={}",
+            update.agent_mode.choices.len(),
+            self.custom_llms.len(),
+        );
+
         let old = std::mem::replace(&mut self.models_by_feature, update);
 
         match serde_json::to_string(&self.models_by_feature) {
@@ -1138,6 +1189,44 @@ impl LLMPreferences {
     /// Called both when the model list is refreshed from the server and when
     /// BYOK API keys change (since `RequiresUpgrade` usability is BYOK-aware).
     fn reconcile_disabled_model_preferences(&self, ctx: &mut ModelContext<Self>) {
+        // Pre-compute the set of server-known model IDs across all features.
+        // We treat a profile selection as "custom" when its ID is NOT in any of these
+        // sets — this is robust to the `self.custom_llms` list being momentarily empty
+        // (e.g. during a transient keychain read), which would otherwise cause us to
+        // misclassify a real custom selection and silently clear it.
+        let agent_mode_ids: HashSet<&LLMId> = self
+            .models_by_feature
+            .agent_mode
+            .choices
+            .iter()
+            .map(|i| &i.id)
+            .collect();
+        let coding_ids: HashSet<&LLMId> = self
+            .models_by_feature
+            .coding
+            .choices
+            .iter()
+            .map(|i| &i.id)
+            .collect();
+        let cli_agent_ids: HashSet<&LLMId> = self
+            .get_cli_agent_available()
+            .choices
+            .iter()
+            .map(|i| &i.id)
+            .collect();
+        let computer_use_ids: HashSet<&LLMId> = self
+            .get_computer_use_available()
+            .choices
+            .iter()
+            .map(|i| &i.id)
+            .collect();
+
+        let custom_llms_len = self.custom_llms.len();
+        log::debug!(
+            "[llms] reconcile: agent_mode_choices={}, custom_llms_len={custom_llms_len}",
+            agent_mode_ids.len(),
+        );
+
         let profiles_model = AIExecutionProfilesModel::handle(ctx);
         profiles_model.update(ctx, |profiles, ctx| {
             for profile_id in profiles.get_all_profile_ids() {
@@ -1148,20 +1237,18 @@ impl LLMPreferences {
                         .as_ref()
                         .unwrap_or(&self.models_by_feature.agent_mode.default_id);
 
-                    // Never clear a user-configured custom-endpoint model: the user owns
-                    // that choice and it should survive server model-list refreshes and
-                    // feature-flag changes.
+                    // Treat any preferred ID that isn't a server-known builtin as a custom
+                    // selection and unconditionally preserve it. This avoids depending on
+                    // `self.custom_llms` being populated at this exact moment.
                     let preferred_base_is_custom = preferred_base_model
                         .as_ref()
-                        .is_some_and(|id| self.custom_llm_info_for_id(id).is_some());
+                        .is_some_and(|id| !agent_mode_ids.contains(id));
 
                     let effective_base_model_usable = self
                         .models_by_feature
                         .agent_mode
                         .usable_info_for_id(effective_base_model_id, ctx)
-                        .or_else(|| {
-                            self.custom_llm_info_for_id_if_enabled(effective_base_model_id, ctx)
-                        });
+                        .or_else(|| self.custom_llm_info_for_id(effective_base_model_id));
                     let effective_base_model_unusable = effective_base_model_usable.is_none();
                     let effective_base_model_is_configurable = effective_base_model_usable
                         .is_some_and(|info| info.context_window.is_configurable);
@@ -1171,6 +1258,10 @@ impl LLMPreferences {
                         && effective_base_model_unusable
                         && !preferred_base_is_custom
                     {
+                        log::warn!(
+                            "[llms] reconcile: clearing base_model for profile {profile_id:?} \
+                             (preferred={preferred_base_model:?}, custom_llms_len={custom_llms_len})",
+                        );
                         profiles.set_base_model(profile_id, None, ctx);
                     }
                     if has_context_window_limit
@@ -1180,42 +1271,47 @@ impl LLMPreferences {
                         profiles.set_context_window_limit(profile_id, None, ctx);
                     }
                     if let Some(preferred_llm_id) = &profile.data().coding_model {
-                        let is_custom = self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        let is_custom = !coding_ids.contains(preferred_llm_id);
                         if !is_custom
                             && self
                                 .models_by_feature
                                 .coding
                                 .usable_info_for_id(preferred_llm_id, ctx)
-                                .or_else(|| {
-                                    self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                                })
+                                .or_else(|| self.custom_llm_info_for_id(preferred_llm_id))
                                 .is_none()
                         {
+                            log::warn!(
+                                "[llms] reconcile: clearing coding_model for profile {profile_id:?} (preferred={preferred_llm_id:?})",
+                            );
                             profiles.set_coding_model(profile_id, None, ctx);
                         }
                     }
                     if let Some(preferred_llm_id) = &profile.data().cli_agent_model {
-                        let is_custom = self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        let is_custom = !cli_agent_ids.contains(preferred_llm_id);
                         if !is_custom
                             && self
                                 .get_cli_agent_available()
                                 .usable_info_for_id(preferred_llm_id, ctx)
-                                .or_else(|| {
-                                    self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                                })
+                                .or_else(|| self.custom_llm_info_for_id(preferred_llm_id))
                                 .is_none()
                         {
+                            log::warn!(
+                                "[llms] reconcile: clearing cli_agent_model for profile {profile_id:?} (preferred={preferred_llm_id:?})",
+                            );
                             profiles.set_cli_agent_model(profile_id, None, ctx);
                         }
                     }
                     if let Some(preferred_llm_id) = &profile.data().computer_use_model {
-                        let is_custom = self.custom_llm_info_for_id(preferred_llm_id).is_some();
+                        let is_custom = !computer_use_ids.contains(preferred_llm_id);
                         if !is_custom
                             && self
                                 .get_computer_use_available()
                                 .usable_info_for_id(preferred_llm_id, ctx)
                                 .is_none()
                         {
+                            log::warn!(
+                                "[llms] reconcile: clearing computer_use_model for profile {profile_id:?} (preferred={preferred_llm_id:?})",
+                            );
                             profiles.set_computer_use_model(profile_id, None, ctx);
                         }
                     }
