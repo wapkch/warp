@@ -156,15 +156,37 @@ fn generate_channel_config_if_needed(target_family: &str, target_os: &str) {
 
     let config_bin = "warp-channel-config";
 
-    // Check if the config binary is available on PATH. If not, we can't generate embedded
-    // configs. This is expected for external contributors building Warp OSS.
-    if Command::new(config_bin)
+    // Check if the config binary is available on PATH. If not, write stub configs so that
+    // the include_str! macros in the binary entry points can still compile. This is expected
+    // for external contributors building Warp OSS without access to the private config repo.
+    let config_bin_available = Command::new(config_bin)
         .arg("--help")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_err()
-    {
+        .is_ok();
+
+    if !config_bin_available {
+        let out_dir = env::var("OUT_DIR").expect("OUT_DIR must be set");
+        // Stub configs per channel — app_id and logfile_name differ per channel.
+        // All other fields point at production servers (telemetry/autoupdate disabled).
+        let channel_stubs: &[(&str, &str, &str)] = &[
+            ("local",   "dev.warp.Warp-Local",   "warp-local.log"),
+            ("dev",     "dev.warp.Warp-Dev",     "warp-dev.log"),
+            ("stable",  "dev.warp.Warp-Stable",  "warp.log"),
+            ("preview", "dev.warp.Warp-Preview",  "warp-preview.log"),
+        ];
+        for (channel, app_id, logfile_name) in channel_stubs {
+            let config_path = Path::new(&out_dir).join(format!("{channel}_config.json"));
+            if !config_path.exists() {
+                let stub = format!(
+                    r#"{{"app_id":"{app_id}","logfile_name":"{logfile_name}","server_config":{{"server_root_url":"https://app.warp.dev","rtc_server_url":"wss://rtc.app.warp.dev/graphql/v2","session_sharing_server_url":"wss://sessions.app.warp.dev","firebase_auth_api_key":"AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs"}},"oz_config":{{"oz_root_url":"https://oz.warp.dev","workload_audience_url":null}},"telemetry_config":null,"autoupdate_config":null,"crash_reporting_config":null,"mcp_static_config":null}}"#
+                );
+                fs::write(&config_path, stub).unwrap_or_else(|err| {
+                    panic!("Failed to write stub config to {}: {err}", config_path.display())
+                });
+            }
+        }
         return;
     }
 
